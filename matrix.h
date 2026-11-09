@@ -1,3 +1,6 @@
+#ifndef MATRIX_H
+#define MATRIX_H
+
 #include <iostream>
 #include <vector>
 #include <stdexcept>
@@ -9,12 +12,17 @@ private:
     
 public:
     Matrix(int r, int c) : rows(r), cols(c) {
+        if (r < 0 || c < 0)
+            throw std::invalid_argument("Matrix dimensions must be non-negative");
         data.resize(rows, std::vector<double>(cols, 0.0));
     }
     
     Matrix(const std::vector<std::vector<double>>& mat) : data(mat) {
         rows = data.size();
         cols = data.empty() ? 0 : data[0].size();
+        for (int i = 1; i < rows; ++i)
+            if (static_cast<int>(data[i].size()) != cols)
+                throw std::invalid_argument("Matrix rows must have equal lengths");
     }
     
     int getRows() const { return rows; }
@@ -107,13 +115,13 @@ public:
     {
         if (cols != other.cols || rows != other.rows)
             throw std::invalid_argument("Matrix dimensions of two summands are unequal");
-        if (cols != other.rows)
-            throw std::invalid_argument("Matrix dimensions incompatible for multiplication");
+        // if (cols != other.rows)
+        //     throw std::invalid_argument("Matrix dimensions incompatible for multiplication");
         for (int i = 0; i < rows; ++i)
             for (int j = 0; j < cols; ++j)
                 data[i][j] += coef*other.data[i][j];
     }
-    double Frobenius()
+    double Frobenius() const
     {
         double retval = 0;
         for (int i = 0; i < rows; ++i)
@@ -129,3 +137,5 @@ public:
                 data[i][j] *= coef;
     }
 };
+
+#endif

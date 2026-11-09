@@ -1,12 +1,12 @@
 
 #include "quiver.h"
+#include <climits>
+#include <stdexcept>
 
 void my_assert(bool exp)
 {
     if (!exp)
-    {
-        bool dummy  = exp;//to put a breakpoint
-    }
+        throw std::logic_error("quiver decomposition invariant failed");
 }
 
 cQuiver::cQuiver()
@@ -20,9 +20,17 @@ cQuiver::~cQuiver()
 }
 int cQuiver::EulerForm(std::vector<int> &alpha, std::vector<int> &beta)
 {
-    int eu = 0, i = 0;
+    if (alpha.size() != static_cast<std::size_t>(xSize) ||
+        beta.size() != static_cast<std::size_t>(xSize))
+        throw std::invalid_argument("Euler form dimension does not match quiver");
+    long long eu = 0;
+    int i = 0;
     for (i = 0; i < xSize; i++)
-        eu += alpha[i]*beta[i];
+    {
+        eu += static_cast<long long>(alpha[i])*beta[i];
+        if (eu < INT_MIN || eu > INT_MAX)
+            throw std::overflow_error("quiver Euler form exceeds integer range");
+    }
 
     for (i = 0; i < xSize; i++)
     {
@@ -31,10 +39,12 @@ int cQuiver::EulerForm(std::vector<int> &alpha, std::vector<int> &beta)
             int k = xArrows[i][j];
             if (k == -1)
                 break;
-            eu -= alpha[i]*beta[k];
+            eu -= static_cast<long long>(alpha[i])*beta[k];
+            if (eu < INT_MIN || eu > INT_MAX)
+                throw std::overflow_error("quiver Euler form exceeds integer range");
         }
     }
-    return eu;
+    return static_cast<int>(eu);
 }
 
 void cQuiver::InitStar(int num_sub)
@@ -723,38 +733,32 @@ void sDecom::Permute(cJustAList *items)
 //between 0 and n_smnds; we need to copy those
 //summands and their multiplicities and then write
 //each to the correct place
-    std::vector<std::vector<int>> summands;
-    std::vector<int> multi;
-    int i = 0;
-    for (; i < size; i++)
-        multi.push_back(-1);
+    std::vector<std::vector<int>> old_summands = smnds;
+    std::vector<int> old_multiplicities = mltp;
+    std::vector<int> indices;
+    std::vector<int> seen(n_smds, 0);
     int max = -1, min = size, num = 0;
     cJustAList *jal = items;
     for (; jal; jal = jal->Next())
     {
         num++;
         int j = jal->Data();
-        if (multi[j] != -1){//twice i in the list
-            my_assert(!"bad data");return;}
+        if (j < 0 || j >= n_smds || seen[j])
+            throw std::invalid_argument("invalid summand permutation");
+        seen[j] = 1;
+        indices.push_back(j);
         if (j < min)
             min = j;
         if (j > max)
             max = j;
-        multi[j] = mltp[j];
-        for (int k = 0; k < size; k++)
-            summands[j][k] = smnds[j][k];
     }
-    if (max<0 || max>size-1 || min<0 || max>size-1 || max-min != num-1){
-        my_assert(!"bad data");return;}
-    i = min;
-    for (jal = items; jal; jal = jal->Next())
+    if (max < 0 || max - min != num - 1)
+        throw std::invalid_argument("summand permutation must cover a contiguous range");
+    for (int i = 0; i < num; ++i)
     {
-        int j = jal->Data();
-        mltp[i] = multi[j];
-        for (int k = 0; k < size; k++)
-            smnds[i][k] = summands[j][k];
-        i++;
+        const int destination = min + i;
+        const int source = indices[i];
+        smnds[destination] = old_summands[source];
+        mltp[destination] = old_multiplicities[source];
     }
 }
-
-
