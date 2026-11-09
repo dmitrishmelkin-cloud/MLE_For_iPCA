@@ -1,12 +1,15 @@
 
 #include "quiver.h"
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 
 void my_assert(bool exp)
 {
     if (!exp)
-    {
-        bool dummy  = exp;//to put a breakpoint
-    }
+        throw std::logic_error("quiver decomposition invariant failed");
 }
 
 cQuiver::cQuiver()
@@ -20,9 +23,17 @@ cQuiver::~cQuiver()
 }
 int cQuiver::EulerForm(std::vector<int> &alpha, std::vector<int> &beta)
 {
-    int eu = 0, i = 0;
+    if (alpha.size() != static_cast<std::size_t>(xSize) ||
+        beta.size() != static_cast<std::size_t>(xSize))
+        throw std::invalid_argument("Euler form dimension does not match quiver");
+    long long eu = 0;
+    int i = 0;
     for (i = 0; i < xSize; i++)
-        eu += alpha[i]*beta[i];
+    {
+        eu += static_cast<long long>(alpha[i])*beta[i];
+        if (eu < INT_MIN || eu > INT_MAX)
+            throw std::overflow_error("quiver Euler form exceeds integer range");
+    }
 
     for (i = 0; i < xSize; i++)
     {
@@ -31,10 +42,12 @@ int cQuiver::EulerForm(std::vector<int> &alpha, std::vector<int> &beta)
             int k = xArrows[i][j];
             if (k == -1)
                 break;
-            eu -= alpha[i]*beta[k];
+            eu -= static_cast<long long>(alpha[i])*beta[k];
+            if (eu < INT_MIN || eu > INT_MAX)
+                throw std::overflow_error("quiver Euler form exceeds integer range");
         }
     }
-    return eu;
+    return static_cast<int>(eu);
 }
 
 void cQuiver::InitStar(int num_sub)
@@ -548,95 +561,96 @@ int sDecom::Solve(int * arr)
 //  0 if no solution
 //  1 if unique solution is nin-negative integer
 //  2 if unique solution is either negative or not integer
-    std::vector<std::vector<double>> coef;
-    std::vector<double> right;
-    std::vector<double> sol;
-//initialize
-    int i = 0;
-    for (i = 0; i < n_smds; i++)
+    if (!arr || size < 0 || n_smds < 0 ||
+        static_cast<int>(smnds.size()) < n_smds)
+        throw std::invalid_argument("invalid canonical decomposition system");
+    for (int i = 0; i < n_smds; ++i)
+        if (static_cast<int>(smnds[i].size()) != size)
+            throw std::invalid_argument("invalid canonical summand dimensions");
+    if (n_smds == 0)
     {
-        sol[i] = 0.;
-        std::vector<double> smd_copy;
-        for (int j = 0; j < size; j++)
+        for (int i = 0; i < size; ++i)
+            if (arr[i] != 0)
+                return 0;
+        mltp.clear();
+        return 1;
+    }
+
+    std::vector<std::vector<double>> augmented(
+        size, std::vector<double>(n_smds + 1, 0.0));
+    double coefficient_scale = 0;
+    double right_scale = 1;
+    for (int row = 0; row < size; ++row)
+    {
+        augmented[row][n_smds] = arr[row];
+        right_scale = std::max(right_scale, mod(static_cast<double>(arr[row])));
+        for (int column = 0; column < n_smds; ++column)
         {
-            smd_copy.push_back(smnds[i][j]);
-            if (i == 0)
-                right.push_back(arr[j]);
+            augmented[row][column] = smnds[column][row];
+            coefficient_scale = std::max(
+                coefficient_scale, mod(augmented[row][column]));
         }
-        coef.push_back(smd_copy);
     }
-//take next column
-    for (i = 0; i < n_smds; i++)
+    if (coefficient_scale == 0)
+        return -1;
+
+    const double tolerance = std::numeric_limits<double>::epsilon() * 64 *
+        std::max(size, n_smds) * coefficient_scale;
+    const double right_tolerance = std::numeric_limits<double>::epsilon() *
+        64 * std::max(size, n_smds) * right_scale;
+    std::vector<int> pivot_columns;
+    int pivot_row = 0;
+    for (int column = 0; column < n_smds && pivot_row < size; ++column)
     {
-        double least = 0.;
-        int best = -1;
-        int j = i;
-        for (j = i; j < size; j++)
+        int best_row = pivot_row;
+        for (int row = pivot_row + 1; row < size; ++row)
+            if (mod(augmented[row][column]) >
+                mod(augmented[best_row][column]))
+                best_row = row;
+        if (mod(augmented[best_row][column]) <= tolerance)
+            continue;
+        std::swap(augmented[pivot_row], augmented[best_row]);
+
+        const double pivot = augmented[pivot_row][column];
+        for (int j = column; j <= n_smds; ++j)
+            augmented[pivot_row][j] /= pivot;
+        for (int row = 0; row < size; ++row)
         {
-            if (coef[i][j] == 0)
+            if (row == pivot_row)
                 continue;
-            if (best != -1 && mod(coef[i][j]) >= least)
-                continue;
-            least = mod(coef[i][j]);
-            best = j;
+            const double factor = augmented[row][column];
+            for (int j = column; j <= n_smds; ++j)
+                augmented[row][j] -= factor * augmented[pivot_row][j];
         }
-        if (best == -1)
-            return -1;//linear dependent
-        if (best > i)
-        {//permute lines i and best
-            double tmp;
-            for (j = i; j < n_smds; j++)
-            {
-                tmp = coef[j][i];
-                coef[j][i] = coef[j][best];
-                coef[j][best] = tmp;
-            }
-            tmp = right[i];
-            right[i] = right[best];
-            right[best] = tmp;
-        }
-        for (j = i+1; j < size; j++)
-        {//subtract line[i]/mul from line j
-            double mul = coef[i][j]/coef[i][i];
-            coef[i][j] = 0.;
-            for (int k = i+1; k < n_smds; k++)
-                coef[k][j] -= coef[k][i]*mul;
-            right[j] -= right[i]*mul;
-        }
+        pivot_columns.push_back(column);
+        ++pivot_row;
     }
-//check that a solution exists; define the presision
-    double eps = 0.01;
-    for (i = n_smds + 1; i < size; i++)
+    if (static_cast<int>(pivot_columns.size()) < n_smds)
+        return -1;
+
+    for (int row = pivot_row; row < size; ++row)
+        if (mod(augmented[row][n_smds]) > right_tolerance)
+            return 0;
+
+    std::vector<double> solution(n_smds, 0.0);
+    for (int row = 0; row < pivot_row; ++row)
+        solution[pivot_columns[row]] = augmented[row][n_smds];
+
+    const double integer_tolerance = 1e-9;
+    std::vector<int> integer_solution(n_smds, 0);
+    for (int i = 0; i < n_smds; ++i)
     {
-        if (mod(right[i]) > eps)
-            break;
+        const double rounded = std::round(solution[i]);
+        if (solution[i] < -integer_tolerance ||
+            mod(solution[i] - rounded) > integer_tolerance ||
+            rounded > std::numeric_limits<int>::max())
+            return 2;
+        integer_solution[i] = static_cast<int>(rounded);
     }
-    if (i < size)
-        return 0;//no solution
-    for (i = n_smds - 1; i >= 0; i--)
-    {
-        sol[i] = right[i];
-        for (int j = i+1; j < n_smds; j++)
-            sol[i] -= coef[j][i]*sol[j];
-        my_assert(mod(coef[i][i]) > eps);
-        sol[i] /= coef[i][i];
-    }
-//check that the solution is natural
-    for (i = 0; i < n_smds; i++)
-    {
-        if (sol[i] < -eps)
-            break;
-        int s = (int)(sol[i]+eps);
-        if (mod(sol[i] - s) > eps)
-            break;
-    }
-    if (i < n_smds)
-        return 2;
-    for (i = 0; i < n_smds; i++)
-        mltp[i] = (int)(sol[i]+eps);
+    mltp = integer_solution;
 //#ifdef _DEBUG
 //check that solution
-    for (i = 0; i < size; i++)
+    for (int i = 0; i < size; i++)
     {
         int a = arr[i];
         for (int j = 0; j < n_smds; j++)
@@ -723,38 +737,32 @@ void sDecom::Permute(cJustAList *items)
 //between 0 and n_smnds; we need to copy those
 //summands and their multiplicities and then write
 //each to the correct place
-    std::vector<std::vector<int>> summands;
-    std::vector<int> multi;
-    int i = 0;
-    for (; i < size; i++)
-        multi.push_back(-1);
+    std::vector<std::vector<int>> old_summands = smnds;
+    std::vector<int> old_multiplicities = mltp;
+    std::vector<int> indices;
+    std::vector<int> seen(n_smds, 0);
     int max = -1, min = size, num = 0;
     cJustAList *jal = items;
     for (; jal; jal = jal->Next())
     {
         num++;
         int j = jal->Data();
-        if (multi[j] != -1){//twice i in the list
-            my_assert(!"bad data");return;}
+        if (j < 0 || j >= n_smds || seen[j])
+            throw std::invalid_argument("invalid summand permutation");
+        seen[j] = 1;
+        indices.push_back(j);
         if (j < min)
             min = j;
         if (j > max)
             max = j;
-        multi[j] = mltp[j];
-        for (int k = 0; k < size; k++)
-            summands[j][k] = smnds[j][k];
     }
-    if (max<0 || max>size-1 || min<0 || max>size-1 || max-min != num-1){
-        my_assert(!"bad data");return;}
-    i = min;
-    for (jal = items; jal; jal = jal->Next())
+    if (max < 0 || max - min != num - 1)
+        throw std::invalid_argument("summand permutation must cover a contiguous range");
+    for (int i = 0; i < num; ++i)
     {
-        int j = jal->Data();
-        mltp[i] = multi[j];
-        for (int k = 0; k < size; k++)
-            smnds[i][k] = summands[j][k];
-        i++;
+        const int destination = min + i;
+        const int source = indices[i];
+        smnds[destination] = old_summands[source];
+        mltp[destination] = old_multiplicities[source];
     }
 }
-
-

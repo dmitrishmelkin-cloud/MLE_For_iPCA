@@ -1,6 +1,10 @@
 #include "matrix.h"
 #include <cstdlib>  // For rand() and srand()
 #include "quiver.h"
+#include "ipca.h"
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 /*
 This file contains:
 1) an imlementation of FlipFlop algorithm
@@ -27,7 +31,45 @@ TESTSZ in Main, it should ne #feature_groups+1
 check it as in the function Main), pass it directly to FlipFlop
 */
 
-std::vector<Matrix> FlipFlop(std::vector<Matrix> FeatureGroups, bool &converged, int &num_loop, int max_loop)
+namespace
+{
+Matrix ShrinkCovariance(const Matrix &covariance, double shrinkage)
+{
+    double mean_diagonal = 0;
+    for (int i = 0; i < covariance.getRows(); ++i)
+        mean_diagonal += covariance.at(i, i);
+    mean_diagonal /= covariance.getRows();
+    if (!std::isfinite(mean_diagonal) || mean_diagonal <= 0)
+        throw std::runtime_error(
+            "cannot regularize covariance with non-positive mean diagonal");
+
+    Matrix result = covariance;
+    result.by_scalar(1.0 - shrinkage);
+    for (int i = 0; i < result.getRows(); ++i)
+        result.at(i, i) += shrinkage * mean_diagonal;
+    return result;
+}
+
+Matrix DampedUpdate(
+    const Matrix &previous,
+    const Matrix &candidate,
+    double shrinkage,
+    double damping)
+{
+    Matrix result = ShrinkCovariance(candidate, shrinkage);
+    result.by_scalar(damping);
+    result.Add(previous, 1.0 - damping);
+    return result;
+}
+
+std::vector<Matrix> RunFlipFlop(
+    const std::vector<Matrix> &FeatureGroups,
+    bool &converged,
+    int &num_loop,
+    int max_loop,
+    double shrinkage,
+    double damping,
+    const FlipFlopObserver &observer)
 {
 //the method obtains an MLE estimate for the covariance matrices of
 //an iPCA model, such that for some observation vectors the features are groupes
@@ -36,15 +78,29 @@ std::vector<Matrix> FlipFlop(std::vector<Matrix> FeatureGroups, bool &converged,
 //of a star quiver is polystable. The user is expected to check the conditions
 //on num_group (num of arrows in star quiver), num_samples (dimesnion of central node),
 //and sizes of groups (dimensopns of side nodes) such that generic point is polystable
-    int num_group = FeatureGroups.size();
+    if (FeatureGroups.empty())
+        throw std::invalid_argument("at least one feature group is required");
+    if (max_loop <= 0)
+        throw std::invalid_argument("maximum iterations must be positive");
+    int num_group = static_cast<int>(FeatureGroups.size());
     int num_samples = FeatureGroups[0].getRows();
-    int total_features = 0;
+    if (num_samples <= 0)
+        throw std::invalid_argument("feature groups must contain at least one sample");
+    long long total_features = 0;
     for (int grp = 0; grp < num_group; grp++)
     {
         if (FeatureGroups[grp].getRows() != num_samples)
              throw std::invalid_argument("different number of samples");
+        if (FeatureGroups[grp].getCols() <= 0)
+            throw std::invalid_argument("feature groups must contain at least one feature");
         total_features += FeatureGroups[grp].getCols();
+        for (int i = 0; i < FeatureGroups[grp].getRows(); ++i)
+            for (int j = 0; j < FeatureGroups[grp].getCols(); ++j)
+                if (!std::isfinite(FeatureGroups[grp].at(i, j)))
+                    throw std::invalid_argument("feature data must be finite");
     }
+    if (total_features > std::numeric_limits<int>::max())
+        throw std::invalid_argument("total number of features exceeds supported range");
     // checked that the input contains num_group matrices of feature groups per sample
     std::vector<Matrix> Covariance;
     Covariance.push_back(Matrix(num_samples,num_samples));
@@ -61,6 +117,7 @@ std::vector<Matrix> FlipFlop(std::vector<Matrix> FeatureGroups, bool &converged,
     
     int loop = 0;
     converged = false;
+    num_loop = -1;
     double epsilon = 0;
     for (; loop < max_loop; loop++)
     {
@@ -70,39 +127,125 @@ std::vector<Matrix> FlipFlop(std::vector<Matrix> FeatureGroups, bool &converged,
         //covariance among the samples
         for (int grp = 0; grp < num_group; grp++)
         {
-            Matrix summand = FeatureGroups[grp];
-            summand = summand.multiply(Covariance[grp+1].inverse());
-            summand = summand.multiply(FeatureGroups[grp].transpose());
+            Matrix solved_transpose = Covariance[grp+1].solve_positive_definite(
+                FeatureGroups[grp].transpose());
+            Matrix summand = FeatureGroups[grp].multiply(solved_transpose);
             new_Sigma.Add(summand);
         }
-        new_Sigma.by_scalar(1.0/total_features);
+        new_Sigma.by_scalar(1.0/static_cast<double>(total_features));
+        if (shrinkage > 0)
+            new_Sigma = DampedUpdate(
+                Covariance[0], new_Sigma, shrinkage, damping);
         //check the magnitude of change
         Matrix diff = Covariance[0];
         diff.Add(new_Sigma,-1);
         epsilon += diff.Frobenius();
         Covariance[0] = new_Sigma; //set new value of Sigma
+        if (observer)
+        {
+            FlipFlopIterationDiagnostics diagnostics;
+            diagnostics.iteration = loop + 1;
+            diagnostics.covariance_index = 0;
+            diagnostics.spectrum =
+                Covariance[0].positive_definite_diagnostics();
+            observer(diagnostics);
+        }
         //then update covariance for every feature group
         for (int grp = 0; grp < num_group; grp++)
         {
-            Matrix new_Delta = FeatureGroups[grp].transpose();
-            new_Delta = new_Delta.multiply(Covariance[0].inverse());
-            new_Delta = new_Delta.multiply(FeatureGroups[grp]);
+            Matrix solved_features =
+                Covariance[0].solve_positive_definite(FeatureGroups[grp]);
+            Matrix new_Delta =
+                FeatureGroups[grp].transpose().multiply(solved_features);
             new_Delta.by_scalar(1.0/num_samples);
+            if (shrinkage > 0)
+                new_Delta = DampedUpdate(
+                    Covariance[grp+1], new_Delta, shrinkage, damping);
             //check the magnitude of change
             Matrix diff = Covariance[grp+1];
             diff.Add(new_Delta,-1);
             epsilon += diff.Frobenius();
             Covariance[grp+1] = new_Delta;//set new value of Delta
+            if (observer)
+            {
+                FlipFlopIterationDiagnostics diagnostics;
+                diagnostics.iteration = loop + 1;
+                diagnostics.covariance_index = grp + 1;
+                diagnostics.spectrum =
+                    Covariance[grp+1].positive_definite_diagnostics();
+                observer(diagnostics);
+            }
         }
         if (epsilon < 1e-10)
         {
             converged = true;
-            num_loop = loop;
+            num_loop = loop + 1;
             break;//converged
         }
     }
+    if (!converged)
+        num_loop = loop;
     return Covariance;
 }
+}
+
+std::vector<Matrix> FlipFlop(
+    const std::vector<Matrix> &FeatureGroups,
+    bool &converged,
+    int &num_loop,
+    int max_loop)
+{
+    return RunFlipFlop(
+        FeatureGroups, converged, num_loop, max_loop, 0.0, 1.0,
+        FlipFlopObserver());
+}
+
+std::vector<Matrix> FlipFlopRegularized(
+    const std::vector<Matrix> &FeatureGroups,
+    bool &converged,
+    int &num_loop,
+    int max_loop,
+    double shrinkage,
+    double damping)
+{
+    if (!std::isfinite(shrinkage) || shrinkage <= 0 || shrinkage >= 1)
+        throw std::invalid_argument("shrinkage must be between 0 and 1");
+    if (!std::isfinite(damping) || damping <= 0 || damping > 1)
+        throw std::invalid_argument("damping must be greater than 0 and at most 1");
+    return RunFlipFlop(
+        FeatureGroups, converged, num_loop, max_loop, shrinkage, damping,
+        FlipFlopObserver());
+}
+
+std::vector<Matrix> FlipFlopWithDiagnostics(
+    const std::vector<Matrix> &FeatureGroups,
+    bool &converged,
+    int &num_loop,
+    int max_loop,
+    const FlipFlopObserver &observer)
+{
+    return RunFlipFlop(
+        FeatureGroups, converged, num_loop, max_loop, 0.0, 1.0, observer);
+}
+
+std::vector<Matrix> FlipFlopRegularizedWithDiagnostics(
+    const std::vector<Matrix> &FeatureGroups,
+    bool &converged,
+    int &num_loop,
+    int max_loop,
+    double shrinkage,
+    double damping,
+    const FlipFlopObserver &observer)
+{
+    if (!std::isfinite(shrinkage) || shrinkage <= 0 || shrinkage >= 1)
+        throw std::invalid_argument("shrinkage must be between 0 and 1");
+    if (!std::isfinite(damping) || damping <= 0 || damping > 1)
+        throw std::invalid_argument("damping must be greater than 0 and at most 1");
+    return RunFlipFlop(
+        FeatureGroups, converged, num_loop, max_loop, shrinkage, damping,
+        observer);
+}
+
 bool TestIPCA(std::vector<int> &alpha)
 {//input is a dimension vector for a star quiver such that 0 vertex is
 //the center and all arrows are i->0
@@ -169,11 +312,9 @@ bool Next(std::vector<int> &arr, int n)
         arr[j] = 0;
     return true;
 }
-int main(int argc, char **argv)
+int RunDemo()
 {
-    cQuiver quiver;
     int TESTSZ = 6;//Test for 5 subspaces quiver having 6 vertices, you can edit as you need
-    quiver.InitStar(TESTSZ-1);
     std::vector<int> al(TESTSZ,0);//this is going to iterate over different 
     //dimension vectors for star quiver, find dimension vectors
     //such that MLE exists generically, sample a representation of 
@@ -203,32 +344,8 @@ int main(int argc, char **argv)
                 2*sum_sub > true_num_sub*al[0] ||//reducible by castling
                 sum_sub == al[0])//obviously locally semisimple
                 continue;
-            int q = quiver.EulerForm(al,al);//to see this metric
-            sDecom d(TESTSZ); 
-            for (i = 0; i < TESTSZ; i++)
-                d.alpha.push_back(al[i]);
-            int num = quiver.GenDecom(&d);
-            if (num < 2)
-            {//Shurian and Schofield stable MLE exists generally
-                num_test_MLE++;
-                TestIPCA(al);
-                if (num_test_MLE ==  max_test_MLE)
-                     break;
-                continue;
-            }
-			int num_im = 0, j=1, num_non_orthog=0;
-			for (i = 0; i < d.n_smds; i++)
-			{
-				if (quiver.EulerForm(d.smnds[i],d.smnds[i]) < 1)
-					num_im++;
-                for (j=i+1; j < d.n_smds; j++)
-                {
-                    my_assert(quiver.EulerForm(d.smnds[i],d.smnds[j])==0);
-                    if (quiver.EulerForm(d.smnds[j],d.smnds[i]) > 0)
-                         num_non_orthog++;
-                }
-			}
-			if (num_non_orthog == 0)
+            std::vector<int> group_sizes(al.begin() + 1, al.end());
+            if (AnalyzeGenericMLEFeasibility(n, group_sizes).generic_mle_feasible)
             {
                 num_test_MLE++;
                 TestIPCA(al);
