@@ -19,6 +19,7 @@ struct FlipFlopIterationDiagnostics
 {
     int iteration;
     int covariance_index;
+    double relative_change;
     PositiveDefiniteDiagnostics spectrum;
 };
 
@@ -29,11 +30,44 @@ FeasibilityResult AnalyzeGenericMLEFeasibility(
     int num_samples,
     const std::vector<int> &group_sizes);
 
+double ObservedDataNegativeLogLikelihood(
+    const std::vector<Matrix> &feature_groups,
+    const std::vector<Matrix> &observation_masks,
+    const Matrix &sample_covariance,
+    const std::vector<Matrix> &group_covariances);
+
+double ObservedDataNegativeLogLikelihood(
+    const std::vector<Matrix> &feature_groups,
+    const std::vector<Matrix> &observation_masks,
+    const Matrix &sample_covariance,
+    const std::vector<Matrix> &group_covariances,
+    const std::vector<std::vector<double>> &feature_means);
+
+double StructuredObservedDataNegativeLogLikelihood(
+    const std::vector<Matrix> &feature_groups,
+    const std::vector<Matrix> &observation_masks,
+    const Matrix &sample_covariance,
+    const std::vector<Matrix> &group_covariances);
+
+double StructuredObservedDataNegativeLogLikelihood(
+    const std::vector<Matrix> &feature_groups,
+    const std::vector<Matrix> &observation_masks,
+    const Matrix &sample_covariance,
+    const std::vector<Matrix> &group_covariances,
+    const std::vector<std::vector<double>> &feature_means);
+
 std::vector<Matrix> FlipFlop(
     const std::vector<Matrix> &feature_groups,
     bool &converged,
     int &num_iterations,
     int max_iterations);
+
+std::vector<Matrix> FlipFlopBalanced(
+    const std::vector<Matrix> &feature_groups,
+    bool &converged,
+    int &num_iterations,
+    int max_iterations,
+    const FlipFlopObserver &observer = FlipFlopObserver());
 
 std::vector<Matrix> FlipFlopRegularized(
     const std::vector<Matrix> &feature_groups,

@@ -65,6 +65,12 @@ double ParseUnitInterval(const std::string &text, const std::string &name)
     return value;
 }
 
+double ParseNoiseScale(const std::string &text)
+{
+    const double value = ParseUnitInterval(text, "relative noise SD");
+    return value;
+}
+
 double ParseShrinkage(const std::string &text)
 {
     const double value = ParseUnitInterval(text, "shrinkage");
@@ -219,6 +225,8 @@ void PrintIterationDiagnostic(
     else
         std::cout << "Delta[" << diagnostics.covariance_index << "]";
     std::cout << "," << std::setprecision(17)
+              << diagnostics.relative_change
+              << ","
               << diagnostics.spectrum.minimum_eigenvalue
               << "," << diagnostics.spectrum.maximum_eigenvalue
               << "," << diagnostics.spectrum.relative_minimum_eigenvalue
@@ -227,7 +235,9 @@ void PrintIterationDiagnostic(
 
 int RunDiagnostics(
     const std::vector<Matrix> &groups,
-    int max_iterations)
+    int max_iterations,
+    double shrinkage = 0,
+    double damping = 1)
 {
     if (groups.empty())
         throw std::invalid_argument("at least one feature group is required");
@@ -240,16 +250,38 @@ int RunDiagnostics(
         AnalyzeGenericMLEFeasibility(groups[0].getRows(), group_sizes);
     PrintFeasibility(feasibility);
 
-    std::cout << "iteration,covariance,lambda_min,lambda_max,"
+    std::cout << "iteration,covariance,relative_change,lambda_min,lambda_max,"
                  "relative_lambda_min,condition_number\n";
     bool converged = false;
     int iterations = -1;
     const FlipFlopObserver observer = PrintIterationDiagnostic;
-    const std::vector<Matrix> covariance = FlipFlopWithDiagnostics(
-        groups, converged, iterations, max_iterations, observer);
+    const std::vector<Matrix> covariance = shrinkage > 0
+        ? FlipFlopRegularizedWithDiagnostics(
+              groups, converged, iterations, max_iterations,
+              shrinkage, damping, observer)
+        : FlipFlopWithDiagnostics(
+              groups, converged, iterations, max_iterations, observer);
     std::cout << "converged: " << (converged ? "yes" : "no") << "\n";
     std::cout << "iterations: " << iterations << "\n";
     return converged ? 0 : 2;
+}
+
+int RunDiagnoseRegularized(int argc, char **argv)
+{
+    if (argc < 6)
+        throw std::invalid_argument(
+            "diagnose-regularized requires an iteration limit, shrinkage, "
+            "damping, and at least one group CSV");
+    const int max_iterations =
+        ParsePositiveInt(argv[2], "maximum iterations");
+    const double shrinkage = ParseShrinkage(argv[3]);
+    const double damping = ParseUnitInterval(argv[4], "damping");
+    std::vector<Matrix> groups;
+    for (int i = 5; i < argc; ++i)
+        groups.push_back(ReadCsvMatrix(argv[i]));
+    std::cout << "regularization: shrinkage=" << shrinkage
+              << ", damping=" << damping << "\n";
+    return RunDiagnostics(groups, max_iterations, shrinkage, damping);
 }
 
 int RunDiagnose(int argc, char **argv)
@@ -299,11 +331,17 @@ void PrintUsage(const char *program)
               << "  " << program << " estimate <max-iterations> <group.csv>...\n"
               << "  " << program << " diagnose <max-iterations> <group.csv>...\n"
               << "  " << program
+              << " diagnose-regularized <max-iterations> <shrinkage>"
+                 " <damping> <group.csv>...\n"
+              << "  " << program
               << " diagnose-gaussian <max-iterations> <samples> <seed>"
                  " <group-features>...\n"
               << "  " << program
               << " estimate-regularized <max-iterations> <shrinkage>"
                  " <damping> <group.csv>...\n"
+              << "  " << program
+              << " estimate-jittered <max-iterations> <relative-noise-SD>"
+                 " <seed> <output-directory> <group.csv>...\n"
               << "  " << program << " demo\n";
 }
 
@@ -366,9 +404,118 @@ int RunEstimate(int argc, char **argv, bool regularized)
         : FlipFlop(groups, converged, iterations, max_iterations);
     if (regularized)
         std::cout << "regularization: shrinkage=" << shrinkage
-                  << ", damping=" << damping << "\n";
+                  << ", damping=" << damping << "\n"
+                  << "convergence_criterion: maximum relative Frobenius change "
+                     "per covariance < 1e-10\n";
     std::cout << "converged: " << (converged ? "yes" : "no") << "\n";
     std::cout << "iterations: " << iterations << "\n";
+    if (!converged)
+        return 2;
+    std::cout << "sample_covariance:\n";
+    covariance[0].print();
+    for (std::size_t i = 1; i < covariance.size(); ++i)
+    {
+        std::cout << "group_covariance_" << i << ":\n";
+        covariance[i].print();
+    }
+    return 0;
+}
+
+int RunEstimateJittered(int argc, char **argv)
+{
+    if (argc < 7)
+        throw std::invalid_argument(
+            "estimate-jittered requires an iteration limit, relative noise "
+            "SD, seed, output directory, and at least one group CSV");
+    const int max_iterations =
+        ParsePositiveInt(argv[2], "maximum iterations");
+    const double noise_sd = ParseNoiseScale(argv[3]);
+    const unsigned int seed = ParseSeed(argv[4]);
+    const std::string output_directory = argv[5];
+    std::mt19937 generator(seed);
+    std::normal_distribution<double> noise(0.0, noise_sd);
+    std::vector<Matrix> groups;
+    std::vector<int> group_sizes;
+    for (int argument = 6; argument < argc; ++argument)
+    {
+        Matrix group = ReadCsvMatrix(argv[argument]);
+        for (int column = 0; column < group.getCols(); ++column)
+        {
+            long double squared_sum = 0;
+            for (int row = 0; row < group.getRows(); ++row)
+            {
+                const long double value = group.at(row, column);
+                squared_sum += value * value;
+            }
+            double rms = std::sqrt(static_cast<double>(
+                squared_sum / group.getRows()));
+            if (!std::isfinite(rms))
+                throw std::runtime_error(
+                    std::string("feature RMS is not finite in ") +
+                    argv[argument]);
+            if (rms == 0)
+                rms = 1;
+            for (int row = 0; row < group.getRows(); ++row)
+            {
+                const double transformed =
+                    group.at(row, column) / rms + noise(generator);
+                if (!std::isfinite(transformed))
+                    throw std::runtime_error(
+                        std::string("jitter produced non-finite data in ") +
+                        argv[argument]);
+                group.set(row, column, transformed);
+            }
+        }
+
+        std::ostringstream output_path;
+        output_path << output_directory << "/jittered_group_";
+        if (groups.size() + 1 < 10)
+            output_path << '0';
+        output_path << groups.size() + 1 << ".csv";
+        std::ofstream output(output_path.str().c_str());
+        if (!output)
+            throw std::runtime_error(
+                "cannot create transformed CSV (ensure output directory exists): " +
+                output_path.str());
+        output << std::setprecision(17);
+        for (int row = 0; row < group.getRows(); ++row)
+        {
+            for (int column = 0; column < group.getCols(); ++column)
+            {
+                if (column)
+                    output << ',';
+                output << group.at(row, column);
+            }
+            output << "\n";
+        }
+        if (!output)
+            throw std::runtime_error(
+                "error writing transformed CSV: " + output_path.str());
+        groups.push_back(group);
+        group_sizes.push_back(group.getCols());
+    }
+
+    std::cout << "data_transform: divide each feature by its RMS, then add "
+                 "independent Gaussian noise\n"
+              << "relative_noise_sd: " << noise_sd << "\n"
+              << "random_seed: " << seed << "\n"
+              << "transformed_groups_saved_to: " << output_directory << "\n";
+    const FeasibilityResult feasibility =
+        AnalyzeGenericMLEFeasibility(groups[0].getRows(), group_sizes);
+    PrintFeasibility(feasibility);
+    if (!feasibility.generic_mle_feasible)
+        std::cout << "warning: generic MLE existence fails for these dimensions; "
+                     "attempting estimation for the supplied data anyway\n";
+
+    bool converged = false;
+    int iterations = -1;
+    const std::vector<Matrix> covariance =
+        FlipFlopBalanced(groups, converged, iterations, max_iterations);
+    std::cout << "estimator: unregularized Flip-Flop on transformed data\n"
+              << "convergence_criterion: maximum relative Frobenius change "
+                 "per covariance < 1e-10 after covariance-scale normalization\n"
+              << "converged: " << (converged ? "yes" : "no") << "\n"
+              << "iterations: " << iterations << "\n";
     if (!converged)
         return 2;
     std::cout << "sample_covariance:\n";
@@ -398,8 +545,12 @@ int main(int argc, char **argv)
             return RunEstimate(argc, argv, false);
         if (command == "estimate-regularized")
             return RunEstimate(argc, argv, true);
+        if (command == "estimate-jittered")
+            return RunEstimateJittered(argc, argv);
         if (command == "diagnose")
             return RunDiagnose(argc, argv);
+        if (command == "diagnose-regularized")
+            return RunDiagnoseRegularized(argc, argv);
         if (command == "diagnose-gaussian")
             return RunDiagnoseGaussian(argc, argv);
         if (command == "demo" && argc == 2)

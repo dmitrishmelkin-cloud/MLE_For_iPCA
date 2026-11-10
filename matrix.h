@@ -311,7 +311,9 @@ public:
         return diagnostics;
     }
 
-    Matrix solve_positive_definite(const Matrix &right_hand_side) const {
+    Matrix solve_positive_definite(
+        const Matrix &right_hand_side,
+        bool check_condition = true) const {
         if (rows != cols)
             throw std::invalid_argument(
                 "Positive-definite solve requires a square coefficient matrix");
@@ -319,22 +321,40 @@ public:
             throw std::invalid_argument(
                 "Right-hand side has incompatible dimensions");
 
-        const PositiveDefiniteDiagnostics diagnostics =
-            positive_definite_diagnostics();
-        if (diagnostics.minimum_eigenvalue <= 0 ||
-            diagnostics.relative_minimum_eigenvalue <= 1e-12 ||
-            diagnostics.condition_number > 1e12)
-            throw std::runtime_error(
-                "Matrix is too ill-conditioned for a stable SPD solve "
-                "(relative minimum eigenvalue " +
-                std::to_string(diagnostics.relative_minimum_eigenvalue) +
-                ", condition number " +
-                std::to_string(diagnostics.condition_number) + ")");
-
         const int n = rows;
+        double scale = 0;
+        if (check_condition)
+        {
+            const PositiveDefiniteDiagnostics diagnostics =
+                positive_definite_diagnostics();
+            if (diagnostics.minimum_eigenvalue <= 0 ||
+                diagnostics.relative_minimum_eigenvalue <= 1e-12 ||
+                diagnostics.condition_number > 1e12)
+                throw std::runtime_error(
+                    "Matrix is too ill-conditioned for a stable SPD solve "
+                    "(relative minimum eigenvalue " +
+                    std::to_string(diagnostics.relative_minimum_eigenvalue) +
+                    ", condition number " +
+                    std::to_string(diagnostics.condition_number) + ")");
+            scale = diagnostics.maximum_eigenvalue;
+        }
+        else
+        {
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j)
+                {
+                    if (!std::isfinite(data[i][j]))
+                        throw std::runtime_error(
+                            "Positive-definite matrix contains a non-finite value");
+                    scale = std::max(scale, std::abs(data[i][j]));
+                }
+            if (scale == 0)
+                throw std::runtime_error(
+                    "Cholesky factorization failed for a zero matrix");
+        }
         Matrix lower(n, n);
-        const double scale = diagnostics.maximum_eigenvalue;
         const double symmetry_tolerance = scale * 1e-12;
+        const double pivot_tolerance = check_condition ? 0 : scale * 1e-12;
         for (int i = 0; i < n; ++i)
         {
             for (int j = 0; j <= i; ++j)
@@ -347,9 +367,10 @@ public:
                     value -= lower.data[i][k] * lower.data[j][k];
                 if (i == j)
                 {
-                    if (!std::isfinite(value) || value <= 0)
+                    if (!std::isfinite(value) || value <= pivot_tolerance)
                         throw std::runtime_error(
-                            "Cholesky factorization failed for SPD matrix");
+                            "Cholesky factorization failed for SPD matrix "
+                            "or detected an unstable pivot");
                     lower.data[i][j] = std::sqrt(value);
                 }
                 else
@@ -359,27 +380,32 @@ public:
             }
         }
 
-        Matrix solution(n, right_hand_side.cols);
-        std::vector<double> forward(n, 0.0);
-        std::vector<double> column_solution(n, 0.0);
-        for (int column = 0; column < right_hand_side.cols; ++column)
+        Matrix solution = right_hand_side;
+        for (int i = 0; i < n; ++i)
         {
-            for (int i = 0; i < n; ++i)
+            for (int k = 0; k < i; ++k)
             {
-                double value = right_hand_side.data[i][column];
-                for (int k = 0; k < i; ++k)
-                    value -= lower.data[i][k] * forward[k];
-                forward[i] = value / lower.data[i][i];
+                const double factor = lower.data[i][k];
+                for (int column = 0; column < right_hand_side.cols; ++column)
+                    solution.data[i][column] -=
+                        factor * solution.data[k][column];
             }
-            for (int i = n - 1; i >= 0; --i)
+            const double diagonal = lower.data[i][i];
+            for (int column = 0; column < right_hand_side.cols; ++column)
+                solution.data[i][column] /= diagonal;
+        }
+        for (int i = n - 1; i >= 0; --i)
+        {
+            for (int k = i + 1; k < n; ++k)
             {
-                double value = forward[i];
-                for (int k = i + 1; k < n; ++k)
-                    value -= lower.data[k][i] * column_solution[k];
-                column_solution[i] = value / lower.data[i][i];
+                const double factor = lower.data[k][i];
+                for (int column = 0; column < right_hand_side.cols; ++column)
+                    solution.data[i][column] -=
+                        factor * solution.data[k][column];
             }
-            for (int i = 0; i < n; ++i)
-                solution.data[i][column] = column_solution[i];
+            const double diagonal = lower.data[i][i];
+            for (int column = 0; column < right_hand_side.cols; ++column)
+                solution.data[i][column] /= diagonal;
         }
         return solution;
     }
@@ -413,8 +439,8 @@ public:
         double retval = 0;
         for (int i = 0; i < rows; ++i)
             for (int j = 0; j < cols; ++j)
-            retval += data[i][j]*data[i][j];
-        return retval;
+                retval += data[i][j] * data[i][j];
+        return std::sqrt(retval);
     }
 
     void by_scalar(double coef)

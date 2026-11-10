@@ -62,6 +62,16 @@ Matrix DampedUpdate(
     return result;
 }
 
+double RelativeChange(const Matrix &previous, const Matrix &current)
+{
+    Matrix difference = previous;
+    difference.Add(current, -1.0);
+    const double scale = std::max(previous.Frobenius(), current.Frobenius());
+    if (scale == 0)
+        return difference.Frobenius();
+    return difference.Frobenius() / scale;
+}
+
 std::vector<Matrix> RunFlipFlop(
     const std::vector<Matrix> &FeatureGroups,
     bool &converged,
@@ -69,7 +79,8 @@ std::vector<Matrix> RunFlipFlop(
     int max_loop,
     double shrinkage,
     double damping,
-    const FlipFlopObserver &observer)
+    const FlipFlopObserver &observer,
+    bool normalize_scale)
 {
 //the method obtains an MLE estimate for the covariance matrices of
 //an iPCA model, such that for some observation vectors the features are groupes
@@ -101,6 +112,16 @@ std::vector<Matrix> RunFlipFlop(
     }
     if (total_features > std::numeric_limits<int>::max())
         throw std::invalid_argument("total number of features exceeds supported range");
+    Matrix combined_features(num_samples, static_cast<int>(total_features));
+    int feature_offset = 0;
+    for (int grp = 0; grp < num_group; ++grp)
+    {
+        for (int i = 0; i < num_samples; ++i)
+            for (int j = 0; j < FeatureGroups[grp].getCols(); ++j)
+                combined_features.set(
+                    i, feature_offset + j, FeatureGroups[grp].at(i, j));
+        feature_offset += FeatureGroups[grp].getCols();
+    }
     // checked that the input contains num_group matrices of feature groups per sample
     std::vector<Matrix> Covariance;
     Covariance.push_back(Matrix(num_samples,num_samples));
@@ -109,8 +130,28 @@ std::vector<Matrix> RunFlipFlop(
     for (int grp = 0; grp < num_group+1; grp++)
     {//set all covariance matices to identities of corresponding sizes
         int group_size = Covariance[grp].getCols();
+        double initial_scale = 1.0;
+        if ((shrinkage > 0 || normalize_scale) && grp > 0)
+        {
+            long double squared_sum = 0;
+            for (int i = 0; i < FeatureGroups[grp - 1].getRows(); ++i)
+                for (int j = 0; j < FeatureGroups[grp - 1].getCols(); ++j)
+                {
+                    const long double value =
+                        FeatureGroups[grp - 1].at(i, j);
+                    squared_sum += value * value;
+                }
+            initial_scale = static_cast<double>(
+                squared_sum /
+                (FeatureGroups[grp - 1].getRows() *
+                 static_cast<long double>(
+                     FeatureGroups[grp - 1].getCols())));
+            if (!std::isfinite(initial_scale) || initial_scale <= 0)
+                throw std::invalid_argument(
+                    "regularized feature groups must have positive finite mean square");
+        }
         for (int i = 0; i< group_size; i++)
-             Covariance[grp].set(i,i,1);
+             Covariance[grp].set(i,i,initial_scale);
 
     }
     //now covariance is initialized and we start iterations
@@ -118,17 +159,18 @@ std::vector<Matrix> RunFlipFlop(
     int loop = 0;
     converged = false;
     num_loop = -1;
-    double epsilon = 0;
     for (; loop < max_loop; loop++)
     {
-
-        epsilon = 0;
+        double epsilon = 0;
+        const bool balance_scale = shrinkage > 0 || normalize_scale;
+        const std::vector<Matrix> previous_covariance =
+            balance_scale ? Covariance : std::vector<Matrix>();
         Matrix new_Sigma(num_samples,num_samples);//first update the
         //covariance among the samples
         for (int grp = 0; grp < num_group; grp++)
         {
             Matrix solved_transpose = Covariance[grp+1].solve_positive_definite(
-                FeatureGroups[grp].transpose());
+                FeatureGroups[grp].transpose(), false);
             Matrix summand = FeatureGroups[grp].multiply(solved_transpose);
             new_Sigma.Add(summand);
         }
@@ -139,22 +181,38 @@ std::vector<Matrix> RunFlipFlop(
         //check the magnitude of change
         Matrix diff = Covariance[0];
         diff.Add(new_Sigma,-1);
-        epsilon += diff.Frobenius();
+        const double sigma_change =
+            balance_scale ? 0 : diff.Frobenius();
+        const double sigma_relative_change = observer && !balance_scale
+            ? RelativeChange(Covariance[0], new_Sigma)
+            : 0;
+        if (!balance_scale)
+            epsilon += sigma_change;
         Covariance[0] = new_Sigma; //set new value of Sigma
-        if (observer)
+        if (observer && !balance_scale)
         {
             FlipFlopIterationDiagnostics diagnostics;
             diagnostics.iteration = loop + 1;
             diagnostics.covariance_index = 0;
+            diagnostics.relative_change = sigma_relative_change;
             diagnostics.spectrum =
                 Covariance[0].positive_definite_diagnostics();
             observer(diagnostics);
         }
         //then update covariance for every feature group
+        Matrix solved_combined =
+            Covariance[0].solve_positive_definite(
+                combined_features, false);
+        feature_offset = 0;
         for (int grp = 0; grp < num_group; grp++)
         {
-            Matrix solved_features =
-                Covariance[0].solve_positive_definite(FeatureGroups[grp]);
+            const int group_features = FeatureGroups[grp].getCols();
+            Matrix solved_features(num_samples, group_features);
+            for (int i = 0; i < num_samples; ++i)
+                for (int j = 0; j < group_features; ++j)
+                    solved_features.set(
+                        i, j, solved_combined.at(i, feature_offset + j));
+            feature_offset += group_features;
             Matrix new_Delta =
                 FeatureGroups[grp].transpose().multiply(solved_features);
             new_Delta.by_scalar(1.0/num_samples);
@@ -164,16 +222,58 @@ std::vector<Matrix> RunFlipFlop(
             //check the magnitude of change
             Matrix diff = Covariance[grp+1];
             diff.Add(new_Delta,-1);
-            epsilon += diff.Frobenius();
+            const double delta_change =
+                balance_scale ? 0 : diff.Frobenius();
+            const double delta_relative_change = observer && !balance_scale
+                ? RelativeChange(Covariance[grp+1], new_Delta)
+                : 0;
+            if (!balance_scale)
+                epsilon += delta_change;
             Covariance[grp+1] = new_Delta;//set new value of Delta
-            if (observer)
+            if (observer && !balance_scale)
             {
                 FlipFlopIterationDiagnostics diagnostics;
                 diagnostics.iteration = loop + 1;
                 diagnostics.covariance_index = grp + 1;
+                diagnostics.relative_change = delta_relative_change;
                 diagnostics.spectrum =
                     Covariance[grp+1].positive_definite_diagnostics();
                 observer(diagnostics);
+            }
+        }
+        if (balance_scale)
+        {
+            double mean_diagonal = 0;
+            for (int i = 0; i < num_samples; ++i)
+                mean_diagonal += Covariance[0].at(i, i);
+            mean_diagonal /= num_samples;
+            if (!std::isfinite(mean_diagonal) || mean_diagonal <= 0 ||
+                !std::isfinite(1.0 / mean_diagonal))
+                throw std::runtime_error(
+                    "cannot normalize regularized sample covariance scale");
+            Covariance[0].by_scalar(1.0 / mean_diagonal);
+            for (std::size_t i = 1; i < Covariance.size(); ++i)
+                Covariance[i].by_scalar(mean_diagonal);
+
+            std::vector<double> relative_changes(Covariance.size());
+            for (std::size_t i = 0; i < Covariance.size(); ++i)
+            {
+                relative_changes[i] =
+                    RelativeChange(previous_covariance[i], Covariance[i]);
+                epsilon = std::max(epsilon, relative_changes[i]);
+            }
+            if (observer)
+            {
+                for (std::size_t i = 0; i < Covariance.size(); ++i)
+                {
+                    FlipFlopIterationDiagnostics diagnostics;
+                    diagnostics.iteration = loop + 1;
+                    diagnostics.covariance_index = static_cast<int>(i);
+                    diagnostics.relative_change = relative_changes[i];
+                    diagnostics.spectrum =
+                        Covariance[i].positive_definite_diagnostics();
+                    observer(diagnostics);
+                }
             }
         }
         if (epsilon < 1e-10)
@@ -197,7 +297,19 @@ std::vector<Matrix> FlipFlop(
 {
     return RunFlipFlop(
         FeatureGroups, converged, num_loop, max_loop, 0.0, 1.0,
-        FlipFlopObserver());
+        FlipFlopObserver(), false);
+}
+
+std::vector<Matrix> FlipFlopBalanced(
+    const std::vector<Matrix> &FeatureGroups,
+    bool &converged,
+    int &num_loop,
+    int max_loop,
+    const FlipFlopObserver &observer)
+{
+    return RunFlipFlop(
+        FeatureGroups, converged, num_loop, max_loop, 0.0, 1.0,
+        observer, true);
 }
 
 std::vector<Matrix> FlipFlopRegularized(
@@ -214,7 +326,7 @@ std::vector<Matrix> FlipFlopRegularized(
         throw std::invalid_argument("damping must be greater than 0 and at most 1");
     return RunFlipFlop(
         FeatureGroups, converged, num_loop, max_loop, shrinkage, damping,
-        FlipFlopObserver());
+        FlipFlopObserver(), false);
 }
 
 std::vector<Matrix> FlipFlopWithDiagnostics(
@@ -225,7 +337,8 @@ std::vector<Matrix> FlipFlopWithDiagnostics(
     const FlipFlopObserver &observer)
 {
     return RunFlipFlop(
-        FeatureGroups, converged, num_loop, max_loop, 0.0, 1.0, observer);
+        FeatureGroups, converged, num_loop, max_loop, 0.0, 1.0,
+        observer, false);
 }
 
 std::vector<Matrix> FlipFlopRegularizedWithDiagnostics(
@@ -243,7 +356,7 @@ std::vector<Matrix> FlipFlopRegularizedWithDiagnostics(
         throw std::invalid_argument("damping must be greater than 0 and at most 1");
     return RunFlipFlop(
         FeatureGroups, converged, num_loop, max_loop, shrinkage, damping,
-        observer);
+        observer, false);
 }
 
 bool TestIPCA(std::vector<int> &alpha)
